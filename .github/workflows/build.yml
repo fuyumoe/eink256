@@ -22,18 +22,19 @@ jobs:
     - name: Setup Android SDK & NDK
       uses: android-actions/setup-android@v3
 
-    # 新增步骤：自动安装项目所需的特定版本 CMake
     - name: Install required CMake
       run: |
         echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "cmake;3.22.1"
 
+    # 改为 assembleDebug，确保无签名配置也能稳稳定定打出 APK 和 .so
     - name: Build with Gradle
       run: |
         chmod +x gradlew
-        ./gradlew assembleRelease
+        ./gradlew assembleDebug
 
+    # 使用全局通配符，抓取 build 目录下生成的所有 .apk 文件
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: eink256-build
-        path: app/build/outputs/apk/release/*.apk
+        path: '**/*.apk'
