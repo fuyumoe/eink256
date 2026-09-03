@@ -3,130 +3,173 @@
 #include <cmath>
 #include <algorithm>
 #include <vector>
-#include <cstring>
 #include <android/log.h>
 
-// 辅助宏：将值限制在 0-255 之间
-#define CLAMP(val) (val < 0 ? 0 : (val > 255 ? 255 : val))
+#define LOG_TAG "Eink256Native"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// --- 像素访问辅助类 ---
+#define CLAMP_255(val) ((val) < 0 ? 0 : ((val) > 255 ? 255 : (val)))
 
-// 针对 ARGB_8888 (32位) 格式的处理
-struct Pixel8888 {
-    // 计算灰度值
-    static int getGray(uint32_t color) {
-        int r = (color >> 16) & 0xFF;
-        int g = (color >> 8) & 0xFF;
-        int b = color & 0xFF;
-        // 经典的亮度公式: Y = 0.299R + 0.587G + 0.114B
-        // 整数优化版: (77R + 150G + 29B) >> 8
-        return (77 * r + 150 * g + 29 * b) >> 8;
+// --- 预计算 Gamma 2.2 查找表 (LUT) ---
+// 解决缺陷二：在循环内部如果调用 powf 会严重卡顿，用 static 数组做 O(1) 查表转换
+static uint8_t sRGB_to_Linear[256];
+static uint8_t Linear_to_sRGB[256];
+static bool isGammaTableInitialized = false;
+
+// 线程安全/一次性初始化 Gamma 查找表
+static void initGammaTables() {
+    if (isGammaTableInitialized) return;
+    for (int i = 0; i < 256; ++i) {
+        float norm = i / 255.0f;
+        
+        // 1. sRGB 空间转换到物理线性空间 (Gamma 2.2 解码)
+        float linear = std::pow(norm, 2.2f);
+        sRGB_to_Linear[i] = static_cast<uint8_t>(std::round(linear * 255.0f));
+        
+        // 2. 物理线性空间转回 sRGB 空间 (Gamma 2.2 编码)
+        float srgb = std::pow(norm, 1.0f / 2.2f);
+        Linear_to_sRGB[i] = static_cast<uint8_t>(std::round(srgb * 255.0f));
     }
+    isGammaTableInitialized = true;
+}
 
-    // 将处理后的灰度值打包回像素
-    static uint32_t pack(uint32_t original, int grayVal) {
-        // 保留原始的 Alpha 通道
-        uint32_t alpha = original & 0xFF000000;
-        return alpha | (grayVal << 16) | (grayVal << 8) | grayVal;
-    }
-};
+// --- 统一像素提取与 Gamma 映射 ---
 
-// 针对 RGB_565 (16位) 格式的处理
-// SubsamplingScaleImageView 和 Glide 经常使用此格式以节省内存
-struct Pixel565 {
-    static int getGray(uint16_t color) {
-        // 提取 5-6-5 分量
-        int r5 = (color >> 11) & 0x1F;
-        int g6 = (color >> 5) & 0x3F;
-        int b5 = color & 0x1F;
+// 解决缺陷一：针对 ARGB_8888 提取完整 8 位（256 阶）输入，并解包到线性空间
+inline int getLinearLuminance8888(uint32_t color) {
+    int r = (color >> 16) & 0xFF;
+    int g = (color >> 8) & 0xFF;
+    int b = color & 0xFF;
 
-        // 将分量扩展到 8位 (0-255) 以便进行灰度计算
-        // (v << 3) | (v >> 2) 是 * 255 / 31 的快速近似算法
-        int r8 = (r5 << 3) | (r5 >> 2);
-        int g8 = (g6 << 2) | (g6 >> 4);
-        int b8 = (b5 << 3) | (b5 >> 2);
+    // 1. 经典人眼感知灰度公式得到 sRGB 灰度 (0-255)
+    uint8_t srgbGray = static_cast<uint8_t>((77 * r + 150 * g + 29 * b) >> 8);
 
-        return (77 * r8 + 150 * g8 + 29 * b8) >> 8;
-    }
+    // 2. 通过 LUT 转为线性空间灰度，防止暗部阶梯断层
+    return sRGB_to_Linear[srgbGray];
+}
 
-    static uint16_t pack(uint16_t original, int grayVal) {
-        // 将 8位灰度值转换回 5-6-5 格式
-        int r5 = grayVal >> 3;
-        int g6 = grayVal >> 2;
-        int b5 = grayVal >> 3;
-        return (r5 << 11) | (g6 << 5) | b5;
-    }
-};
+// 解决缺陷一：针对 RGB_565，进行无损位深扩展（5/6 bit -> 8 bit）后再解包到线性空间
+inline int getLinearLuminance565(uint16_t color) {
+    int r5 = (color >> 11) & 0x1F;
+    int g6 = (color >> 5) & 0x3F;
+    int b5 = color & 0x1F;
 
-// --- 模板化抖动算法 ---
-// T: 像素数据类型 (uint32_t 或 uint16_t)
-// Handler: 负责颜色转换的辅助类
-template <typename T, typename Handler>
-void applyDitherTemplate(void* pixelsRaw, int width, int height) {
-    T* pixels = (T*)pixelsRaw;
-    
-    // 使用一维数组 + 指针交换，避免矢量深拷贝
-    std::vector<int> errBuf1(width + 2, 0);
-    std::vector<int> errBuf2(width + 2, 0);
-    int* currRowErr = errBuf1.data() + 1;
-    int* nextRowErr = errBuf2.data() + 1;
+    // 位深精确扩展到 256 阶 (0-255)
+    int r8 = (r5 << 3) | (r5 >> 2);
+    int g8 = (g6 << 2) | (g6 >> 4);
+    int b8 = (b5 << 3) | (b5 >> 2);
+
+    uint8_t srgbGray = static_cast<uint8_t>((77 * r8 + 150 * g8 + 29 * b8) >> 8);
+    return sRGB_to_Linear[srgbGray];
+}
+
+// 打包回 ARGB_8888 (保留 Alpha 通道)
+inline uint32_t pack8888(uint32_t originalColor, uint8_t srgbGray) {
+    uint32_t alpha = originalColor & 0xFF000000;
+    return alpha | (srgbGray << 16) | (srgbGray << 8) | srgbGray;
+}
+
+// 打包回 RGB_565
+inline uint16_t pack565(uint8_t srgbGray) {
+    int r5 = srgbGray >> 3;
+    int g6 = srgbGray >> 2;
+    int b5 = srgbGray >> 3;
+    return static_cast<uint16_t>((r5 << 11) | (g6 << 5) | b5);
+}
+
+// --- 高精度线性空间 Floyd-Steinberg 误差扩散 ---
+
+template <typename T>
+void applyLinearFloydSteinberg(void* pixelsRaw, int width, int height, bool is8888) {
+    T* pixels = static_cast<T*>(pixelsRaw);
+
+    // 256 阶灰度量化步长 (E-ink 常用 16 阶灰度输出: STEP = 255 / 15 = 17)
+    // 如果你需要纯黑白二值抖动，可以将 LEVEL 改为 2，STEP 改为 255
+    const int LEVELS = 16;
+    const int STEP = 255 / (LEVELS - 1);
+
+    // 使用双行滑动误差缓冲区（以像素为单位），带左右边界保护
+    std::vector<int> currRowErr(width + 2, 0);
+    std::vector<int> nextRowErr(width + 2, 0);
 
     for (int y = 0; y < height; ++y) {
+        std::fill(nextRowErr.begin(), nextRowErr.end(), 0);
+
         for (int x = 0; x < width; ++x) {
             int index = y * width + x;
             T originalColor = pixels[index];
-            
-            // 1. 提取灰度并叠加误差
-            int gray = Handler::getGray(originalColor);
-            int currentVal = CLAMP(gray + currRowErr[x]);
 
-            // 2. 无浮点数的高精度 16 阶量化 ((currentVal + 8) / 17 * 17)
-            int newGray = ((currentVal + 8) * 15 / 255) * 17;
-            newGray = CLAMP(newGray);
+            // 1. 提取线性空间灰度 (Linear Lum)
+            int linearLum = is8888 ? getLinearLuminance8888(originalColor)
+                                   : getLinearLuminance565(originalColor);
 
-            // 3. 计算量化误差
-            int quantError = currentVal - newGray;
+            // 2. 加上上一级传过来的扩散误差
+            int adjustedLinear = linearLum + currRowErr[x + 1];
+            adjustedLinear = CLAMP_255(adjustedLinear);
 
-            // 4. Floyd-Steinberg 纯整数位移扩散 (7/16, 3/16, 5/16, 1/16)
-            if (x + 1 < width) {
-                currRowErr[x + 1] += (quantError * 7) >> 4;
+            // 3. 在线性空间下进行多阶量化
+            int quantizedLinear = static_cast<int>(std::round(static_cast<float>(adjustedLinear) / STEP)) * STEP;
+            quantizedLinear = CLAMP_255(quantizedLinear);
+
+            // 4. 将量化后的线性灰度编码回 sRGB 空间写回内存
+            uint8_t finalSrgb = Linear_to_sRGB[quantizedLinear];
+            if (is8888) {
+                pixels[index] = pack8888(originalColor, finalSrgb);
+            } else {
+                pixels[index] = pack565(finalSrgb);
             }
-            if (y + 1 < height) {
-                nextRowErr[x - 1] += (quantError * 3) >> 4;
-                nextRowErr[x]     += (quantError * 5) >> 4;
-                nextRowErr[x + 1] += (quantError * 1) >> 4;
-            }
 
-            // 5. 写回内存
-            pixels[index] = Handler::pack(originalColor, newGray);
+            // 5. 计算线性空间下的精确量化残差 (Error)
+            int quantError = adjustedLinear - quantizedLinear;
+
+            // 6. 无损 Floyd-Steinberg 误差扩散 (7/16, 3/16, 5/16, 1/16)
+            // 右
+            currRowErr[x + 2] += (quantError * 7) / 16;
+            // 左下
+            nextRowErr[x]     += (quantError * 3) / 16;
+            // 下
+            nextRowErr[x + 1] += (quantError * 5) / 16;
+            // 右下
+            nextRowErr[x + 2] += (quantError * 1) / 16;
         }
 
-        // 高效交换指针，零内存开销
+        // 交换滑动缓冲区
         std::swap(currRowErr, nextRowErr);
-        std::fill(nextRowErr - 1, nextRowErr + width + 1, 0);
     }
 }
 
+// --- JNI 入口 ---
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_zyyme_eink256_Eink256Native_ditherBitmap(JNIEnv* env, jclass clazz, jobject bitmap) {
+    // 确保 Gamma 2.2 LUT 表初始化完成
+    initGammaTables();
+
     AndroidBitmapInfo info;
     void* pixels;
 
-    if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
-    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-
-    // 会打到logcat
-    __android_log_print(ANDROID_LOG_INFO, "zyymeEink256", "Dithering Bitmap: W=%d H=%d Format=%d", info.width, info.height, info.format);
-
-    // 根据图片格式分发到不同的处理逻辑
-    if (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) {
-        // 标准 32位图片
-        applyDitherTemplate<uint32_t, Pixel8888>(pixels, info.width, info.height);
-    } else if (info.format == ANDROID_BITMAP_FORMAT_RGB_565) {
-        // 16位图片 (SubsamplingScaleImageView 常用)
-        applyDitherTemplate<uint16_t, Pixel565>(pixels, info.width, info.height);
+    if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) {
+        LOGE("AndroidBitmap_getInfo failed");
+        return;
     }
-    // 其他格式暂不支持（如 HARDWARE 已在 Java 层被拦截降级）
+
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) {
+        LOGE("AndroidBitmap_lockPixels failed");
+        return;
+    }
+
+    LOGI("Processing Dither (Linear Gamma 2.2): W=%d, H=%d, Format=%d", info.width, info.height, info.format);
+
+    if (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        // 最佳 256 阶全彩输入
+        applyLinearFloydSteinberg<uint32_t>(pixels, info.width, info.height, true);
+    } else if (info.format == ANDROID_BITMAP_FORMAT_RGB_565) {
+        // 兼容 16 位输入（做无损 256 阶位深拉伸后处理）
+        applyLinearFloydSteinberg<uint16_t>(pixels, info.width, info.height, false);
+    } else {
+        LOGE("Unsupported bitmap format: %d", info.format);
+    }
 
     AndroidBitmap_unlockPixels(env, bitmap);
 }
