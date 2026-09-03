@@ -64,58 +64,46 @@ struct Pixel565 {
 template <typename T, typename Handler>
 void applyDitherTemplate(void* pixelsRaw, int width, int height) {
     T* pixels = (T*)pixelsRaw;
-    // 16阶灰度，步长 step = 255 / 15 = 17
-    const int STEP = 255 / (16 - 1);
-
-    // 使用滑动行缓冲来存储误差，极大地减少内存占用并提高缓存命中率
-    // currRowErr: 当前行传递的误差
-    // nextRowErr: 下一行累积的误差
-    std::vector<int> currRowErr(width, 0);
-    std::vector<int> nextRowErr(width, 0);
+    
+    // 使用一维数组 + 指针交换，避免矢量深拷贝
+    std::vector<int> errBuf1(width + 2, 0);
+    std::vector<int> errBuf2(width + 2, 0);
+    int* currRowErr = errBuf1.data() + 1;
+    int* nextRowErr = errBuf2.data() + 1;
 
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             int index = y * width + x;
             T originalColor = pixels[index];
             
-            // 1. 获取灰度
+            // 1. 提取灰度并叠加误差
             int gray = Handler::getGray(originalColor);
+            int currentVal = CLAMP(gray + currRowErr[x]);
 
-            // 2. 加上来自周围像素扩散过来的误差
-            gray += currRowErr[x];
-
-            // 3. 量化 (找到最近的 16阶 层级)
-            int newGray = std::round((float)gray / STEP) * STEP;
+            // 2. 无浮点数的高精度 16 阶量化 ((currentVal + 8) / 17 * 17)
+            int newGray = ((currentVal + 8) * 15 / 255) * 17;
             newGray = CLAMP(newGray);
 
-            // 4. 计算量化误差
-            int quantError = gray - newGray;
+            // 3. 计算量化误差
+            int quantError = currentVal - newGray;
 
-            // 5. 扩散误差 (Floyd-Steinberg 算法)
-            // 系数: 右 7/16, 左下 3/16, 下 5/16, 右下 1/16
-            
-            // 向右
+            // 4. Floyd-Steinberg 纯整数位移扩散 (7/16, 3/16, 5/16, 1/16)
             if (x + 1 < width) {
-                currRowErr[x + 1] += quantError * 7 / 16;
+                currRowErr[x + 1] += (quantError * 7) >> 4;
             }
-            
-            // 向下一行
             if (y + 1 < height) {
-                // 左下
-                if (x - 1 >= 0) nextRowErr[x - 1] += quantError * 3 / 16;
-                // 下
-                nextRowErr[x] += quantError * 5 / 16;
-                // 右下
-                if (x + 1 < width) nextRowErr[x + 1] += quantError * 1 / 16;
+                nextRowErr[x - 1] += (quantError * 3) >> 4;
+                nextRowErr[x]     += (quantError * 5) >> 4;
+                nextRowErr[x + 1] += (quantError * 1) >> 4;
             }
 
-            // 6. 写回内存
+            // 5. 写回内存
             pixels[index] = Handler::pack(originalColor, newGray);
         }
 
-        // 行结束：交换缓冲区，清空下一行缓冲区
-        currRowErr = nextRowErr;
-        std::fill(nextRowErr.begin(), nextRowErr.end(), 0);
+        // 高效交换指针，零内存开销
+        std::swap(currRowErr, nextRowErr);
+        std::fill(nextRowErr - 1, nextRowErr + width + 1, 0);
     }
 }
 
