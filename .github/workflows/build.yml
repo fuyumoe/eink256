@@ -14,25 +14,23 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Set up JDK 17
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@v5
       with:
         java-version: '17'
         distribution: 'temurin'
 
-    - name: Setup Android SDK & NDK
+    - name: Setup Android SDK
       uses: android-actions/setup-android@v3
 
-    - name: Install required CMake
+    - name: Install NDK and CMake
       run: |
-        echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "cmake;3.22.1"
+        echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "cmake;3.22.1" "ndk;25.2.9519653"
 
-    # 改为 assembleDebug，确保无签名配置也能稳稳定定打出 APK 和 .so
     - name: Build with Gradle
       run: |
         chmod +x gradlew
         ./gradlew assembleDebug
 
-    # 使用全局通配符，抓取 build 目录下生成的所有 .apk 文件
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
