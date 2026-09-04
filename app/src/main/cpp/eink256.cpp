@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include <android/log.h>
 
 #define LOG_TAG "zyymeEink256"
@@ -44,7 +45,10 @@ static void init_tables() {
         } else {
             double norm = (i - 45.0) / (215.0 - 45.0); // 归一化到 0~1
             double sigmoid = 1.0 / (1.0 + exp(-6.0 * (norm - 0.5))); // Sigmoid 曲线
-            CONTRAST_LUT[i] = static_cast<uint8_t>(std::clamp(sigmoid * 255.0, 0.0, 255.0));
+            double val = sigmoid * 255.0;
+            if (val < 0.0) val = 0.0;
+            if (val > 255.0) val = 255.0;
+            CONTRAST_LUT[i] = static_cast<uint8_t>(val);
         }
     }
 
@@ -166,7 +170,7 @@ void applyHighQualityDither(void* pixelsRaw, int width, int height) {
                 }
             }
         } else {
-            // --- 反向扫描（从右向左，消除消除结构性斜线） ---
+            // --- 反向扫描（从右向左，消除结构性斜线） ---
             for (int x = width - 1; x >= 0; --x) {
                 int idx = row_offset + x;
                 T originalColor = pixels[idx];
