@@ -20,7 +20,7 @@ static bool g_tables_initialized = false;
 // 1. 16阶灰度精准映射表 (0, 17, 34, ..., 255)
 static uint8_t LEVEL_TBL[256];
 
-// 2. S型伽马/对比度拉伸表 (切断双线性插值带来的伪灰阶)
+// 2. 温和 S 型对比度拉伸表 (提亮暗部、保留图像层次，同时切断插值伪灰阶)
 static uint8_t CONTRAST_LUT[256];
 
 // 3. RGB565 转换查找表
@@ -35,16 +35,16 @@ static void init_tables() {
         LEVEL_TBL[i] = static_cast<uint8_t>(((i + 8) / 17) * 17);
     }
 
-    // 初始化 S 型对比度增强 LUT
-    // 逻辑：压暗 < 45 的深灰为 0；拉亮 > 215 的浅灰为 255；中间调做 S-Curve 提升对比度
+    // 初始化温和的 S 型对比度增强 LUT
+    // 调整说明：只切除 ≤10 和 ≥245 的极端伪阶；中间采用温和 S 曲线（强度3.5），中心点移至 0.42 以大幅提亮暗部细节
     for (int i = 0; i < 256; ++i) {
-        if (i < 45) {
+        if (i <= 10) {
             CONTRAST_LUT[i] = 0;
-        } else if (i > 215) {
+        } else if (i >= 245) {
             CONTRAST_LUT[i] = 255;
         } else {
-            double norm = (i - 45.0) / (215.0 - 45.0); // 归一化到 0~1
-            double sigmoid = 1.0 / (1.0 + exp(-6.0 * (norm - 0.5))); // Sigmoid 曲线
+            double norm = (i - 10.0) / (245.0 - 10.0); // 归一化到 0~1
+            double sigmoid = 1.0 / (1.0 + exp(-3.5 * (norm - 0.42))); // 中心点移至 0.42，提亮暗部
             double val = sigmoid * 255.0;
             if (val < 0.0) val = 0.0;
             if (val > 255.0) val = 255.0;
@@ -138,7 +138,7 @@ void applyHighQualityDither(void* pixelsRaw, int width, int height) {
                 int idx = row_offset + x;
                 T originalColor = pixels[idx];
 
-                // 1. 获取基础灰度并进行 S-Curve 预处理
+                // 1. 获取基础灰度并进行温和 S-Curve 预处理（提亮暗部）
                 int src_gray = Handler::getGray(originalColor);
                 int contrast_gray = CONTRAST_LUT[src_gray];
 
