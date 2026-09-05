@@ -3,12 +3,12 @@
 #include <algorithm>
 #include <vector>
 #include <cstring>
+#include <cmath>
 #include <android/log.h>
 
 #define CLAMP(val) (val < 0 ? 0 : (val > 255 ? 255 : val))
 
-// --- 预计算 Gamma 2.2 查表与反查表（解决暗部过渡不自然） ---
-// 静态初始化，零运行期计算开销
+// --- 预计算 Gamma 1.8 查表与反查表（解决暗部/发尾过渡不自然） ---
 static unsigned char GAMMA_LUT[256];
 static unsigned char INV_GAMMA_LUT[256];
 static bool is_gamma_inited = false;
@@ -16,9 +16,8 @@ static bool is_gamma_inited = false;
 static void initGammaTable() {
     if (is_gamma_inited) return;
     for (int i = 0; i < 256; ++i) {
-        // Gamma 2.2 扩展暗部动态范围，让暗部渐变更平滑
         float norm = i / 255.0f;
-        GAMMA_LUT[i] = (unsigned char)(powf(norm, 1.8f) * 255.0f + 0.5f); // 针对墨水屏微调为 1.8
+        GAMMA_LUT[i] = (unsigned char)(powf(norm, 1.8f) * 255.0f + 0.5f); // 墨水屏微调 Gamma 1.8
         INV_GAMMA_LUT[i] = (unsigned char)(powf(norm, 1.0f / 1.8f) * 255.0f + 0.5f);
     }
     is_gamma_inited = true;
@@ -89,9 +88,12 @@ void applyDitherTemplate(void* pixelsRaw, int width, int height) {
             // 2. 叠加扩散误差并约束范围
             int gray = CLAMP(rawGray + currRowErr[x]);
 
-            // 3. 改进量化：加入极微小的轻微扰动（1bit 伪随机），打碎黑块与条纹
-            // 这能极大地减少“浅黑变深黑”的视觉硬块，同时分散墨水屏孤立黑点，减轻残影
-            int ditherNoise = ((x ^ y) & 1) - 1; 
+            // 3. 优化量化逻辑：
+            // ① 使用无周期的空间 Hash 混淆，代替原来的 ((x^y)&1) 棋盘格，彻底消除了缩放时的方形干涉色块
+            // ② 仅在中暗区 (gray < 180) 叠加微弱扰动打散阶梯，较亮区域保持纯净不加噪点
+            int hashNoise = ((x * 1259 + y * 29573) ^ (x >> 1)) & 1; 
+            int ditherNoise = (gray < 180) ? hashNoise : 0;
+
             int level = (gray + 8 + ditherNoise) / STEP;
             if (level < 0) level = 0;
             if (level > 15) level = 15;
@@ -100,9 +102,9 @@ void applyDitherTemplate(void* pixelsRaw, int width, int height) {
             // 4. 计算量化误差
             int quantError = gray - newGray;
 
-            // 5. Floyd-Steinberg 扩散（配合 C 指针直接加减）
+            // 5. Floyd-Steinberg 扩散（位运算 >>4 代替 /16）
             if (x + 1 < width) {
-                currRowErr[x + 1] += (quantError * 7) >> 4; // 位运算 >>4 代替 /16
+                currRowErr[x + 1] += (quantError * 7) >> 4;
             }
             
             if (y + 1 < height) {
@@ -111,7 +113,7 @@ void applyDitherTemplate(void* pixelsRaw, int width, int height) {
                 if (x + 1 < width) nextRowErr[x + 1] += (quantError * 1) >> 4;
             }
 
-            // 6. 转换回色彩并写回
+            // 6. 转换回色彩并写回内存
             pixels[index] = Handler::pack(originalColor, newGray);
         }
 
