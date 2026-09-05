@@ -58,7 +58,7 @@ void applyDitherFast(void* pixelsRaw, int width, int height) {
     initLUT();
     T* pixels = (T*)pixelsRaw;
 
-    // 多申请几个空间防止极端情况越界
+    // 分配安全宽度的缓冲区（左右各留 2 个安全余量，绝对不越界）
     int* errBuf0 = new int[width + 4]();
     int* errBuf1 = new int[width + 4]();
 
@@ -70,8 +70,8 @@ void applyDitherFast(void* pixelsRaw, int width, int height) {
     for (int y = 0; y < height; ++y) {
         bool hasNextRow = (y < lastRow);
 
-        // 针对非最后一行的高速循环（内层无任何 if 分支！）
         if (hasNextRow) {
+            // 核心内层循环：无任何 if 分支，全速流水线运行
             for (int x = 0; x < width; ++x) {
                 T originalColor = pixels[x];
                 int gray = Handler::getGray(originalColor) + currRowErr[x];
@@ -87,7 +87,7 @@ void applyDitherFast(void* pixelsRaw, int width, int height) {
                 pixels[x] = Handler::pack(originalColor, newGray);
             }
         } else {
-            // 最后一行：不需要向下传递误差，彻底剥离分支
+            // 最后一行处理
             for (int x = 0; x < width; ++x) {
                 T originalColor = pixels[x];
                 int gray = Handler::getGray(originalColor) + currRowErr[x];
@@ -101,18 +101,11 @@ void applyDitherFast(void* pixelsRaw, int width, int height) {
 
         pixels += width;
         
-        // 交换缓冲区
+        // 交换缓冲区指针（零开销）
         std::swap(currRowErr, nextRowErr);
 
-        // 【优化点】：不再使用全行 memset，改为精准清除下一行即将用到的区域
-        // 这样比 memset 整行快数倍
-        nextRowErr[-1] = 0;
-        nextRowErr[0]  = 0;
-        nextRowErr[1]  = 0;
-        // 顺便把尾部可能被污染的几个关键位置清零
-        nextRowErr[width - 1] = 0;
-        nextRowErr[width]     = 0;
-        nextRowErr[width + 1] = 0;
+        // 使用安全的 memset 清空下一行缓冲区（经过系统级底层汇编优化，速度极快且 100% 安全）
+        std::memset(nextRowErr - 2, 0, (width + 4) * sizeof(int));
     }
 
     delete[] errBuf0;
