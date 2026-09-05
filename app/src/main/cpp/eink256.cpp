@@ -4,7 +4,6 @@
 #include <cstring>
 #include <cstdint>
 #include <utility>
-#include <omp.h> // 引入 OpenMP 头文件
 #include <android/log.h>
 
 #define CLAMP(val) (val < 0 ? 0 : (val > 255 ? 255 : val))
@@ -54,61 +53,70 @@ static void initLUT() {
 }
 
 template <typename T, typename Handler>
-void applyDitherWavefront(void* pixelsRaw, int width, int height) {
+void applyDitherFast(void* pixelsRaw, int width, int height) {
+    if (width <= 0 || height <= 0) return;
     initLUT();
     T* pixels = (T*)pixelsRaw;
 
-    // 为全图准备误差传递矩阵（按行存储）
-    // 为了防止多线程竞争，每一行分配独立的误差 Buffer
-    int** errBuffers = new int*[height];
-    for (int i = 0; i < height; ++i) {
-        errBuffers[i] = new int[width + 2](); // 带 padding
-    }
+    // 多申请几个空间防止极端情况越界
+    int* errBuf0 = new int[width + 4]();
+    int* errBuf1 = new int[width + 4]();
 
-    // 计算反角斜线（Wavefront）的总步数: width + height - 1
-    int numDiagonals = width + height - 1;
+    int* currRowErr = errBuf0 + 2; 
+    int* nextRowErr = errBuf1 + 2;
 
-    // 使用 OpenMP 将对角线波浪交由多核 CPU 并行处理
-    for (int diag = 0; diag < numDiagonals; ++diag) {
-        // 计算当前对角线上的起始与结束行
-        int startY = std::max(0, diag - width + 1);
-        int endY = std::min(height - 1, diag);
+    int lastRow = height - 1;
 
-        #pragma omp parallel for schedule(static)
-        for (int y = startY; y <= endY; ++y) {
-            int x = diag - y;
+    for (int y = 0; y < height; ++y) {
+        bool hasNextRow = (y < lastRow);
 
-            T* rowPixels = pixels + y * width;
-            T originalColor = rowPixels[x];
+        // 针对非最后一行的高速循环（内层无任何 if 分支！）
+        if (hasNextRow) {
+            for (int x = 0; x < width; ++x) {
+                T originalColor = pixels[x];
+                int gray = Handler::getGray(originalColor) + currRowErr[x];
+                int newGray = GRAY_LUT[gray + 255];
+                int quantError = gray - newGray;
 
-            int* currRowErr = errBuffers[y] + 1;
-            int gray = Handler::getGray(originalColor) + currRowErr[x];
-            int newGray = GRAY_LUT[gray + 255];
-            int quantError = gray - newGray;
+                currRowErr[x + 1] += (quantError * 7) >> 4;
 
-            // 1. 向右扩散 (同一行)
-            currRowErr[x + 1] += (quantError * 7) >> 4;
-
-            // 2. 向下一行扩散 (线程安全：下一行的 x-1, x, x+1 此时还没有被下个线程读取)
-            if (y + 1 < height) {
-                int* nextRowErr = errBuffers[y + 1] + 1;
-                #pragma omp atomic
                 nextRowErr[x - 1] += (quantError * 3) >> 4;
-                #pragma omp atomic
                 nextRowErr[x]     += (quantError * 5) >> 4;
-                #pragma omp atomic
                 nextRowErr[x + 1] += quantError >> 4;
+
+                pixels[x] = Handler::pack(originalColor, newGray);
             }
+        } else {
+            // 最后一行：不需要向下传递误差，彻底剥离分支
+            for (int x = 0; x < width; ++x) {
+                T originalColor = pixels[x];
+                int gray = Handler::getGray(originalColor) + currRowErr[x];
+                int newGray = GRAY_LUT[gray + 255];
+                int quantError = gray - newGray;
 
-            rowPixels[x] = Handler::pack(originalColor, newGray);
+                currRowErr[x + 1] += (quantError * 7) >> 4;
+                pixels[x] = Handler::pack(originalColor, newGray);
+            }
         }
+
+        pixels += width;
+        
+        // 交换缓冲区
+        std::swap(currRowErr, nextRowErr);
+
+        // 【优化点】：不再使用全行 memset，改为精准清除下一行即将用到的区域
+        // 这样比 memset 整行快数倍
+        nextRowErr[-1] = 0;
+        nextRowErr[0]  = 0;
+        nextRowErr[1]  = 0;
+        // 顺便把尾部可能被污染的几个关键位置清零
+        nextRowErr[width - 1] = 0;
+        nextRowErr[width]     = 0;
+        nextRowErr[width + 1] = 0;
     }
 
-    // 释放内存
-    for (int i = 0; i < height; ++i) {
-        delete[] errBuffers[i];
-    }
-    delete[] errBuffers;
+    delete[] errBuf0;
+    delete[] errBuf1;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -120,9 +128,9 @@ Java_com_zyyme_eink256_Eink256Native_ditherBitmap(JNIEnv* env, jclass clazz, job
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
 
     if (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) {
-        applyDitherWavefront<uint32_t, Pixel8888>(pixels, info.width, info.height);
+        applyDitherFast<uint32_t, Pixel8888>(pixels, info.width, info.height);
     } else if (info.format == ANDROID_BITMAP_FORMAT_RGB_565) {
-        applyDitherWavefront<uint16_t, Pixel565>(pixels, info.width, info.height);
+        applyDitherFast<uint16_t, Pixel565>(pixels, info.width, info.height);
     }
 
     AndroidBitmap_unlockPixels(env, bitmap);
