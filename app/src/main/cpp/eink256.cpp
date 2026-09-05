@@ -2,6 +2,8 @@
 #include <android/bitmap.h>
 #include <algorithm>
 #include <cstring>
+#include <cstdint>
+#include <utility>
 #include <android/log.h>
 
 #define CLAMP(val) (val < 0 ? 0 : (val > 255 ? 255 : val))
@@ -39,16 +41,16 @@ struct Pixel565 {
     }
 };
 
-// 预算 16 阶灰度查找表 (LUT) 以替代 round() 和除法
+// 预算 16 阶灰度查找表 (LUT)
 static int LUT_INITIALIZED = 0;
-static uint8_t GRAY_LUT[768]; // 支持 [-255, 512] 的灰度范围索引
+static uint8_t GRAY_LUT[768]; // 支持 [-255, 512] 灰度范围
 
 static void initLUT() {
     if (LUT_INITIALIZED) return;
-    const float STEP = 255.0f / 15.0f; // 16阶灰度步长 17
+    // 纯整数四舍五入算量化阶梯，免去 cmath 依赖与浮点运算
     for (int i = -255; i <= 512; ++i) {
         int clamped = CLAMP(i);
-        int quantized = (int)(std::round(clamped / STEP) * STEP);
+        int quantized = ((clamped + 8) / 17) * 17;
         GRAY_LUT[i + 255] = (uint8_t)CLAMP(quantized);
     }
     LUT_INITIALIZED = 1;
