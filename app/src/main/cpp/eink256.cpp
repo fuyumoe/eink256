@@ -13,26 +13,35 @@
 
 // 针对 ARGB_8888 (32位) 格式的处理
 struct Pixel8888 {
+    // 计算灰度值
     static int getGray(uint32_t color) {
         int r = (color >> 16) & 0xFF;
         int g = (color >> 8) & 0xFF;
         int b = color & 0xFF;
+        // 经典的亮度公式: Y = 0.299R + 0.587G + 0.114B
+        // 整数优化版: (77R + 150G + 29B) >> 8
         return (77 * r + 150 * g + 29 * b) >> 8;
     }
 
+    // 将处理后的灰度值打包回像素
     static uint32_t pack(uint32_t original, int grayVal) {
+        // 保留原始的 Alpha 通道
         uint32_t alpha = original & 0xFF000000;
         return alpha | (grayVal << 16) | (grayVal << 8) | grayVal;
     }
 };
 
 // 针对 RGB_565 (16位) 格式的处理
+// SubsamplingScaleImageView 和 Glide 经常使用此格式以节省内存
 struct Pixel565 {
     static int getGray(uint16_t color) {
+        // 提取 5-6-5 分量
         int r5 = (color >> 11) & 0x1F;
         int g6 = (color >> 5) & 0x3F;
         int b5 = color & 0x1F;
 
+        // 将分量扩展到 8位 (0-255) 以便进行灰度计算
+        // (v << 3) | (v >> 2) 是 * 255 / 31 的快速近似算法
         int r8 = (r5 << 3) | (r5 >> 2);
         int g8 = (g6 << 2) | (g6 >> 4);
         int b8 = (b5 << 3) | (b5 >> 2);
@@ -41,6 +50,7 @@ struct Pixel565 {
     }
 
     static uint16_t pack(uint16_t original, int grayVal) {
+        // 将 8位灰度值转换回 5-6-5 格式
         int r5 = grayVal >> 3;
         int g6 = grayVal >> 2;
         int b5 = grayVal >> 3;
@@ -48,12 +58,18 @@ struct Pixel565 {
     }
 };
 
-// --- 模板化抖动算法 (优化暗部细节与性能) ---
+// --- 模板化抖动算法 ---
+// T: 像素数据类型 (uint32_t 或 uint16_t)
+// Handler: 负责颜色转换的辅助类
 template <typename T, typename Handler>
 void applyDitherTemplate(void* pixelsRaw, int width, int height) {
     T* pixels = (T*)pixelsRaw;
-    const int STEP = 17; // 255 / 15 = 17
+    // 16阶灰度，步长 step = 255 / 15 = 17
+    const int STEP = 17;
 
+    // 使用滑动行缓冲来存储误差，极大地减少内存占用并提高缓存命中率
+    // currRowErr: 当前行传递的误差
+    // nextRowErr: 下一行累积的误差
     std::vector<int> currRowErr(width, 0);
     std::vector<int> nextRowErr(width, 0);
 
@@ -62,30 +78,40 @@ void applyDitherTemplate(void* pixelsRaw, int width, int height) {
             int index = y * width + x;
             T originalColor = pixels[index];
             
-            // 1. 获取原始灰度 (0-255)
+            // 1. 获取灰度
             int rawGray = Handler::getGray(originalColor);
 
-            // 2. 加上扩散过来的误差，并进行 Clamp 限制
-            // 关键改动 A：防止暗部负误差过度累积死锁，保留暗部微弱的阶梯细节
+            // 2. 加上来自周围像素扩散过来的误差
+            // 核心修改点 1：对“原始灰度+扩散误差”进行 Clamp 截断
+            // 避免大面积暗部向后不断扩散极大的负误差，导致暗部像素被强行拉低变成死黑
             int gray = CLAMP(rawGray + currRowErr[x]);
 
-            // 3. 量化 (定点数四舍五入，替换掉极其缓慢且丢失暗部阶梯的 std::round)
-            // 关键改动 B：(gray + 8) / 17 能够平滑处理 0~8 范围内的极暗像素
+            // 3. 纯整数四舍五入量化 (找到最近的 16阶 层级)
+            // 核心修改点 2：使用 (gray + 8) / 17 替代 std::round((float)gray / STEP)
+            // ① 移除了浮点数转换，大大加快运行效率
+            // ② 解决极暗区域（灰度值 0~8）直接被截断归零的问题，消除暗部色块阶梯
             int level = (gray + 8) / STEP;
-            if (level > 15) level = 15; // 边界保护
+            if (level > 15) level = 15; // 边界防御，防止超出 15 阶
             int newGray = level * STEP;
 
             // 4. 计算量化误差
             int quantError = gray - newGray;
 
             // 5. 扩散误差 (Floyd-Steinberg 算法)
+            // 系数: 右 7/16, 左下 3/16, 下 5/16, 右下 1/16
+            
+            // 向右
             if (x + 1 < width) {
                 currRowErr[x + 1] += quantError * 7 / 16;
             }
             
+            // 向下一行
             if (y + 1 < height) {
+                // 左下
                 if (x - 1 >= 0) nextRowErr[x - 1] += quantError * 3 / 16;
+                // 下
                 nextRowErr[x] += quantError * 5 / 16;
+                // 右下
                 if (x + 1 < width) nextRowErr[x + 1] += quantError * 1 / 16;
             }
 
@@ -93,7 +119,7 @@ void applyDitherTemplate(void* pixelsRaw, int width, int height) {
             pixels[index] = Handler::pack(originalColor, newGray);
         }
 
-        // 行结束：交换缓冲区
+        // 行结束：交换缓冲区，清空下一行缓冲区
         currRowErr = nextRowErr;
         std::fill(nextRowErr.begin(), nextRowErr.end(), 0);
     }
@@ -107,13 +133,18 @@ Java_com_zyyme_eink256_Eink256Native_ditherBitmap(JNIEnv* env, jclass clazz, job
     if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
 
+    // 会打到logcat
     __android_log_print(ANDROID_LOG_INFO, "zyymeEink256", "Dithering Bitmap: W=%d H=%d Format=%d", info.width, info.height, info.format);
 
+    // 根据图片格式分发到不同的处理逻辑
     if (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        // 标准 32位图片
         applyDitherTemplate<uint32_t, Pixel8888>(pixels, info.width, info.height);
     } else if (info.format == ANDROID_BITMAP_FORMAT_RGB_565) {
+        // 16位图片 (SubsamplingScaleImageView 常用)
         applyDitherTemplate<uint16_t, Pixel565>(pixels, info.width, info.height);
     }
+    // 其他格式暂不支持（如 HARDWARE 已在 Java 层被拦截降级）
 
     AndroidBitmap_unlockPixels(env, bitmap);
 }
