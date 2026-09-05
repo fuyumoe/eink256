@@ -4,11 +4,11 @@
 #include <cstring>
 #include <cstdint>
 #include <utility>
+#include <omp.h> // 引入 OpenMP 头文件
 #include <android/log.h>
 
 #define CLAMP(val) (val < 0 ? 0 : (val > 255 ? 255 : val))
 
-// 针对 ARGB_8888 格式
 struct Pixel8888 {
     static inline int getGray(uint32_t color) {
         int r = (color >> 16) & 0xFF;
@@ -22,7 +22,6 @@ struct Pixel8888 {
     }
 };
 
-// 针对 RGB_565 格式
 struct Pixel565 {
     static inline int getGray(uint16_t color) {
         int r5 = (color >> 11) & 0x1F;
@@ -41,13 +40,11 @@ struct Pixel565 {
     }
 };
 
-// 预算 16 阶灰度查找表 (LUT)
 static int LUT_INITIALIZED = 0;
-static uint8_t GRAY_LUT[768]; // 支持 [-255, 512] 灰度范围
+static uint8_t GRAY_LUT[768];
 
 static void initLUT() {
     if (LUT_INITIALIZED) return;
-    // 纯整数四舍五入算量化阶梯，免去 cmath 依赖与浮点运算
     for (int i = -255; i <= 512; ++i) {
         int clamped = CLAMP(i);
         int quantized = ((clamped + 8) / 17) * 17;
@@ -57,56 +54,61 @@ static void initLUT() {
 }
 
 template <typename T, typename Handler>
-void applyDitherFast(void* pixelsRaw, int width, int height) {
+void applyDitherWavefront(void* pixelsRaw, int width, int height) {
     initLUT();
     T* pixels = (T*)pixelsRaw;
 
-    // 使用原生数组 & 指针交换，杜绝 std::vector 深拷贝
-    int* errBuf0 = new int[width + 2](); // 左右各留 1 个 padding，免去越界判断
-    int* errBuf1 = new int[width + 2]();
+    // 为全图准备误差传递矩阵（按行存储）
+    // 为了防止多线程竞争，每一行分配独立的误差 Buffer
+    int** errBuffers = new int*[height];
+    for (int i = 0; i < height; ++i) {
+        errBuffers[i] = new int[width + 2](); // 带 padding
+    }
 
-    int* currRowErr = errBuf0 + 1; // 偏移 1 个单位，允许 [-1] 访问
-    int* nextRowErr = errBuf1 + 1;
+    // 计算反角斜线（Wavefront）的总步数: width + height - 1
+    int numDiagonals = width + height - 1;
 
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            T originalColor = pixels[x];
+    // 使用 OpenMP 将对角线波浪交由多核 CPU 并行处理
+    for (int diag = 0; diag < numDiagonals; ++diag) {
+        // 计算当前对角线上的起始与结束行
+        int startY = std::max(0, diag - width + 1);
+        int endY = std::min(height - 1, diag);
 
-            // 1. 获取灰度 & 加误差
+        #pragma omp parallel for schedule(static)
+        for (int y = startY; y <= endY; ++y) {
+            int x = diag - y;
+
+            T* rowPixels = pixels + y * width;
+            T originalColor = rowPixels[x];
+
+            int* currRowErr = errBuffers[y] + 1;
             int gray = Handler::getGray(originalColor) + currRowErr[x];
-
-            // 2. 极速 O(1) 查表量化
             int newGray = GRAY_LUT[gray + 255];
-
-            // 3. 计算量化误差
             int quantError = gray - newGray;
 
-            // 4. 移位扩散误差 (全整数位移，免除法)
-            // 向右: 7/16
+            // 1. 向右扩散 (同一行)
             currRowErr[x + 1] += (quantError * 7) >> 4;
 
+            // 2. 向下一行扩散 (线程安全：下一行的 x-1, x, x+1 此时还没有被下个线程读取)
             if (y + 1 < height) {
-                // 左下: 3/16, 下: 5/16, 右下: 1/16
+                int* nextRowErr = errBuffers[y + 1] + 1;
+                #pragma omp atomic
                 nextRowErr[x - 1] += (quantError * 3) >> 4;
+                #pragma omp atomic
                 nextRowErr[x]     += (quantError * 5) >> 4;
+                #pragma omp atomic
                 nextRowErr[x + 1] += quantError >> 4;
             }
 
-            // 5. 写回内存
-            pixels[x] = Handler::pack(originalColor, newGray);
+            rowPixels[x] = Handler::pack(originalColor, newGray);
         }
-
-        // 移动到下一行指针
-        pixels += width;
-
-        // 零开销交换行缓冲区
-        std::swap(currRowErr, nextRowErr);
-        // 清空下一行累积误差
-        std::memset(nextRowErr - 1, 0, (width + 2) * sizeof(int));
     }
 
-    delete[] errBuf0;
-    delete[] errBuf1;
+    // 释放内存
+    for (int i = 0; i < height; ++i) {
+        delete[] errBuffers[i];
+    }
+    delete[] errBuffers;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -118,9 +120,9 @@ Java_com_zyyme_eink256_Eink256Native_ditherBitmap(JNIEnv* env, jclass clazz, job
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
 
     if (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) {
-        applyDitherFast<uint32_t, Pixel8888>(pixels, info.width, info.height);
+        applyDitherWavefront<uint32_t, Pixel8888>(pixels, info.width, info.height);
     } else if (info.format == ANDROID_BITMAP_FORMAT_RGB_565) {
-        applyDitherFast<uint16_t, Pixel565>(pixels, info.width, info.height);
+        applyDitherWavefront<uint16_t, Pixel565>(pixels, info.width, info.height);
     }
 
     AndroidBitmap_unlockPixels(env, bitmap);
